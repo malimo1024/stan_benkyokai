@@ -9,6 +9,8 @@ output:
     self_contained: false
 ---
 
+github: https://github.com/malimo1024/stan_benkyokai
+
 #RStanのインストール
 
 RStanは字義通りstanをRから扱うインターフェース． 
