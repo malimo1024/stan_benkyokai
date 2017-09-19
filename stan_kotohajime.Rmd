@@ -1,0 +1,575 @@
+---
+title: "RStanによるベイズ推定事始め"
+author: "Naoki Maejima"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+#RStanのインストール
+
+RStanは字義通りstanをRから扱うインターフェース． 
+
+```{r eval=FALSE}
+install.packages("rstan") #なにはともあれrstanをまずインストール
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,include = TRUE,warning = FALSE,cache = TRUE)
+
+library(dplyr)
+library(magrittr)
+library(rstan)
+library(knitr)
+library(ggplot2)
+library(plotly)
+library(DT)
+```
+
+#magrittrパッケージのpipe記法について
+
+このレポートでは簡便のためにpipe記法を用います．
+
+```{r}
+x = c(1,10)
+y = round(mean(x)) #g(f(x))
+y
+```
+
+と
+
+```{r}
+x = c(1,10)
+x %>% mean() %>% round() -> y #()は省略可能
+y
+```
+
+は同じ合成関数の別の表現。
+
+#データの読み込み
+
+- 今回はYouTuberのHIKAKINと，その兄SEIKINの動画データ(_TVチャンネル)を使います．
+    - データはYouTube Data API v3を用いて取得しています(get_videos.R)．
+    - dataフォルダにはその他いろいろなYouTube動画データを取り揃えています．
+
+```{r readdata}
+hikakin_tv <- read.csv("data/hikakin_tv.csv",stringsAsFactors = FALSE)[,-1]
+seikin_tv <- read.csv("data/seikin_tv.csv",stringsAsFactors = FALSE)[,-1]
+data <- bind_rows(list("hikakin"=hikakin_tv,"seikin"=seikin_tv),.id = "label") #ラベルつきで合併
+```
+
+#概観をつかむ
+
+```{r}
+data %>% head %>% kable
+```
+
+##データクレンジング
+
+```{r}
+data$publish <- data$publish %>% as.Date
+```
+
+- publish(動画アップロード日)をDate型に変換しておく．
+
+```{r}
+data %>% filter(is.na(publish)|
+                is.na(title)|
+                is.na(viewCount)|
+                is.na(likeCount)|
+                is.na(dislikeCount)|
+                is.na(commentCount)) %>% kable(caption = "NAを含む行")
+```
+
+- 一部動画のviewCount,likeCount,dislikeCountにNAが含まれているので，該当行をリストワイズで取り除く．
+
+```{r}
+data <- na.omit(data)
+```
+
+
+
+##要約統計量
+
+```{r}
+data %>% group_by(label) %>% summarise_if(is.numeric,mean) %>% kable(caption = "平均")
+data %>% group_by(label) %>% summarise_if(is.numeric,median) %>% kable(caption = "中央値")
+data %>% group_by(label) %>% summarise_if(is.numeric,sd) %>% kable(caption = "標準偏差")
+```
+
+- 平均値だとHIKAKINのほうが高い（外れ値の影響？）．
+- 中央値だとSEIKINのほうが高い．
+
+###ヒストグラム
+
+```{r}
+g <- ggplot(data=data,aes(x=viewCount))
+g <- g + geom_histogram(position = "identity")
+g <- g + facet_wrap(~label)
+ggplotly(g)
+```
+
+- 指数分布っぽくなる(Webデータあるある)．
+- 対数変換して正規分布に近似させる．
+
+```{r}
+data <- data %>% mutate(log_viewCount=log(viewCount))
+g <- ggplot(data=data,aes(x=log_viewCount))
+g <- g + geom_histogram(position = "identity")
+g <- g + facet_wrap(~label)
+ggplotly(g)
+```
+
+#平均の差の検定
+
+- HIKAKINとSEIKINどちらが平均(対数)再生回数が高いのか？
+
+###まずはフツーに頻度主義的にやる
+
+- t検定(片側，等分散仮定あり)
+
+```{r}
+t.test(data$log_viewCount[data$label=="hikakin"],data$log_viewCount[data$label=="seikin"],var.equal = TRUE,alternative = "less")
+```
+
+- t検定(片側，等分散仮定なし)
+
+```{r}
+t.test(data$log_viewCount[data$label=="hikakin"],data$log_viewCount[data$label=="seikin"],var.equal = FALSE,alternative = "less")
+```
+
+- SEIKINのほうが対数再生回数の平均が有意に高い．
+
+###stanを使ってベイズ的にやる
+
+- stanに渡すデータの整備
+
+```{r}
+N_h <- nrow(data %>% filter(label=="hikakin")) #HIKAKINのケース数
+N_s <- nrow(data %>% filter(label=="seikin")) #SEIKINのケース数
+Y_h <- data$log_viewCount[data$label=="hikakin"] #HIKAKINの対数再生回数
+Y_s <- data$log_viewCount[data$label=="seikin"] #SEIKINの対数再生回数
+standata_youtubers <- list(N_h=N_h,N_s=N_s,Y_h=Y_h,Y_s=Y_s) #stanに渡すデータの整備
+```
+#### stanコード
+
+```{stan output.var="stanmodel_youtubers",eval = FALSE,cache = FALSE}
+data { //データの型宣言
+  int N_h; //ケース数
+  int N_s;
+  real Y_h[N_h]; //対数視聴回数(ベクトル)
+  real Y_s[N_s];
+}
+
+parameters { //パラメータの型宣言
+  real<lower=0> mu_h; //平均
+  real<lower=0> mu_s;
+  real<lower=0> sigma_h; //標準偏差
+  real<lower=0> sigma_s;
+}
+
+model { //尤度と事前分布の記述．今回は事前分布を省略=無情報事前分布を使用
+  for (n in 1:N_h) {
+    Y_h[n] ~ normal(mu_h,sigma_h);　//パラメータは対数家されて__lpに加算されていく
+  }
+  for (n in 1:N_s) {
+    Y_s[n] ~ normal(mu_s,sigma_s);
+  }
+}
+```
+
+外部のstanファイルを呼んでコンパイルする場合は以下のように書けばよい．
+
+```{r}
+stanmodel_normal <- rstan::stan_model(file = "normal.stan")
+```
+
+```{r}
+#上記のコンパイル済みstanモデルにデータを渡してサンプリング
+youtubers_sample <- sampling(stanmodel_normal,data = standata_youtubers,core = 4,iter = 4000) #core数は適宜してください
+```
+
+```{r}
+#トレースプロットを確認
+traceplot(youtubers_sample,c("mu_h"))
+traceplot(youtubers_sample,c("mu_s"))
+traceplot(youtubers_sample,c("sigma_h"))
+traceplot(youtubers_sample,c("sigma_s"))
+
+ex <- rstan::extract(youtubers_sample)
+
+#HIKAKIN < SEIKINの仮説が正しい確率
+mean(ex$mu_h < ex$mu_s)
+```
+
+####予測分布
+
+```{r}
+#パラメータの事後平均を求める
+eap_mu_h <- mean(ex$mu_h)
+eap_sigma_h <- mean(ex$sigma_h)
+
+#予測分布
+eap_predicted <- rnorm(n = N_h,mean = eap_mu_h,sd = eap_sigma_h)
+hist_data <- data.frame(original=data$log_viewCount[data$label=="hikakin"],predicted=eap_predicted) %>% reshape2::melt()
+
+#予測分布のプロット
+g <- ggplot(data=hist_data,aes(x=value,fill=variable))
+g <- g + geom_histogram(position = "identity",alpha = 0.8)
+ggplotly(g)
+```
+
+- なんとなくもとの分布を再現できている…？
+
+####とはいえ正規分布ではなさそう
+
+- Shapiro-Wilkの正規性検定だと余裕で帰無仮説（分布が正規分布）が棄却される．
+
+```{r}
+shapiro.test(data$log_viewCount[data$label=="hikakin"])
+shapiro.test(data$log_viewCount[data$label=="seikin"])
+```
+
+###ワイブル分布でモデリング
+
+- もう少し歪みを表現しやすい分布を使ってみる．
+- ワイブル分布を採用．確率密度関数は以下のようになる．
+    $m$ が形状パラメータ
+    $\eta$が尺度パラメータ
+- ガンマ分布などを使っても構わないと思います
+    
+$$ Weibull(x | m,\eta)=\frac{m}{\eta}(\frac{x}{\eta})^{m-1}exp(-(\frac{x}{\eta})^{m}) $$
+ワイブル分布の平均は，
+$$ \mu=\eta \Gamma(1 + \frac{1}{m}) $$
+で定義される．
+
+####stanコード
+```{stan output.var="weibull_stanmodel_youtubers",eval=FALSE,cache = FALSE}
+data {
+  int N_h; 
+  int N_s;
+  real Y_h[N_h];
+  real Y_s[N_s];
+}
+
+parameters {
+  real<lower=0> m_h; //形状パラメータ
+  real<lower=0> m_s;
+  real<lower=0> eta_h; //尺度パラメータ
+  real<lower=0> eta_s;
+}
+
+model {
+  for(i in 1:N_h){
+    Y_h[i] ~ weibull(m_h, eta_h);
+  }
+  for(j in 1:N_s){
+    Y_s[j] ~ weibull(m_s, eta_s);
+  }
+}
+```
+
+```{r}
+#stanコードをコンパイル
+weibull_stanmodel_youtubers <- rstan::stan_model(file = "weibull.stan")
+```
+
+```{r}
+#上記のコンパイル済みstanモデルにデータを渡してサンプリング
+weibull_youtubers_sample <- sampling(weibull_stanmodel_youtubers,data=standata_youtubers,core = 4, iter = 4000)
+```
+
+```{r}
+#パラメータのトレースプロットを確認
+traceplot(weibull_youtubers_sample,c("m_h"))
+traceplot(weibull_youtubers_sample,c("m_s"))
+traceplot(weibull_youtubers_sample,c("eta_h"))
+traceplot(weibull_youtubers_sample,c("eta_s"))
+
+weibull_ex <- rstan::extract(weibull_youtubers_sample)
+
+#ワイブル分布の期待値をそれぞれ算出
+weibull_expected_h <- weibull_ex$eta_h * gamma(1 + (1/weibull_ex$m_h)) 
+weibull_expected_s <- weibull_ex$eta_s * gamma(1 + (1/weibull_ex$m_s))
+
+#HIKAKIN < SEIKINの仮説が正しい確率
+mean(weibull_expected_h < weibull_expected_s)
+```
+
+- ワイブル分布でのモデリングにおいても先ほどと同じ結果が得られた．
+
+####予測分布
+
+```{r}
+#パラメータの事後平均を計算
+eap_m_h <- mean(weibull_ex$m_h)
+eap_eta_h <- mean(weibull_ex$eta_h)
+
+#予測分布
+eap_predicted <- rweibull(N_h,shape=eap_eta_h,scale=eap_eta_h)
+hist_data <- data.frame(original=data$log_viewCount[data$label=="hikakin"],predicted=eap_predicted) %>% reshape2::melt()
+
+#予測分布のプロット
+g <- ggplot(data=hist_data,aes(x=value,fill=variable))
+g <- g + geom_histogram(position = "identity",alpha = 0.8)
+ggplotly(g)
+```
+
+**形状はほぼ一致**
+
+#状態空間モデルによる時系列モデリング
+
+- 再生回数を時系列モデルを使って予測する．
+
+###状態空間モデルとは
+
+- それ自体は観測されない真の状態(1つ前の状態に依存)が観測誤差を伴って観測されるというモデル．それぞれのレベルのノイズには正規分布を仮定するのが一般的．
+
+#####観測モデル 
+$$ y_t \sim N(\mu_t,\sigma_{obs}) $$
+
+#####システムモデル
+$$ \mu_t \sim N(\mu_{t-1},\sigma_{state}) $$
+
+
+####まずはデータを作る
+- 2015年のHIKAKIN_TVの対数再生回数の時系列データを構成する． 
+- 同日中に複数の動画がアップロードされていた場合，それらの平均をとる．
+
+```{r}
+timeseries_data <- data %>% filter(label == "hikakin",format(publish,"%Y") == "2015") %>% group_by(publish) %>% summarise(mean_log_viewCount=mean(log_viewCount)) #2015年のHIKAKINの動画に限定
+days_in_the_year <- seq.Date(min(timeseries_data$publish),max(timeseries_data$publish),by="day") 
+missing_date <- days_in_the_year[which(!days_in_the_year %in% timeseries_data$publish)]  #欠損している日付を取り出す
+missing_date_df <- data.frame(missing_date,9999) %>% set_colnames(c("publish","mean_log_viewCount"))
+timeseries_data <- bind_rows(timeseries_data,missing_date_df) %>% arrange(publish)
+```
+
+####概形
+```{r}
+head(timeseries_data) %>% head() %>% kable()
+g <- ggplot(data=timeseries_data %>% filter(mean_log_viewCount < 9999),aes(x=publish,y=mean_log_viewCount))
+g <- g + geom_line(stat="identity")
+ggplotly(g)
+```
+
+###ノイズに正規分布を仮定する
+- stanに渡すデータの整備
+```{r}
+t_miss <- length(missing_date)
+Y_t <- timeseries_data$mean_log_viewCount #対数視聴回数
+t_pred <- 30
+t_miss <- t_miss + 30
+Y_t <- c(Y_t,rep(9999,t_pred))
+t <- length(Y_t)
+
+standata_timeseries <- list(t=t,t_miss=t_miss,Y_t=Y_t)
+```
+
+####stanコード
+
+```{stan output.var="youtubers_state_space_stanmodel",eval=FALSE,cache = FALSE}
+data {
+    int t;
+    int t_miss;
+    real Y_t[t];
+}
+
+parameters {
+    real<lower=0> mu[t];
+    real<lower=0> Y_miss[t_miss];
+    real<lower=0> sigma_state;
+    real<lower=0> sigma_observation;
+    real<lower=0> mu_init;
+}
+
+model {
+    int n_miss;
+    n_miss = 0;
+    for(i in 1:t){
+      if(i == 1){
+        mu[i] ~ normal(mu_init,sigma_state); //システムモデル(i=1)
+        Y_t[i] ~ normal(mu[i],sigma_observation); //観測モデル(i=1)
+      }else{
+        if(Y_t[i]!=9999){
+          Y_t[i] ~ normal(mu[i],sigma_observation); 
+        }else{
+          n_miss = n_miss + 1;
+          Y_miss[n_miss] ~ normal(mu[i],sigma_observation); //観測モデル(欠損値)
+        }
+        mu[i] ~ normal(mu[i-1],sigma_state); //システムモデル(i=>2)
+      }
+    }
+}
+```
+- 参考：http://kosugitti.net/archives/5786
+    - 欠損値を予測に使うというアイデアを拝借しました．
+
+####推定
+```{r}
+#stanコードをコンパイル
+youtubers_state_space_stanmodel <- rstan::stan_model(file = "state_space.stan")
+```
+
+```{r}
+# 上記のコンパイル済みstanモデルにデータを渡してサンプリング
+state_space_sample <- sampling(youtubers_state_space_stanmodel,data = standata_timeseries,core =  4,iter = 4000)
+```
+
+```{r}
+#トレースプロットを確認
+traceplot(state_space_sample,c("sigma_state"))
+traceplot(state_space_sample,c("sigma_observation"))
+traceplot(state_space_sample,c("mu_init"))
+
+state_space_ex <- rstan::extract(state_space_sample)
+```
+
+- システムレベルノイズの自己相関が深刻．
+- 収束が微妙なことには目をつぶって先へ進む．
+
+```{r}
+original = Y_t
+mu_state = apply(X = state_space_ex$mu,FUN = mean,MARGIN = 2)
+quant <- apply(state_space_ex$mu,2,quantile,c(0.05,0.95)) #95%信用区間を計算
+date_seq <- seq.Date(as.Date("2015-01-01"),as.Date("2015-12-31")+30,by="days")
+plot_data <- data.frame(original=original,mu_state=mu_state,date_seq=date_seq,c05=quant[1,],c95=quant[2,])
+plot_data$original[plot_data$original==9999] <- NA
+
+#真の平均の推移を合わせてプロット
+g <- ggplot(data=plot_data)
+g <- g + geom_line(aes(x=date_seq,y=original))
+g <- g + geom_line(aes(x=date_seq,y=mu_state),col="blue")
+g <- g + geom_ribbon(aes(x=date_seq,ymin=c05,ymax=c95),col="blue",alpha=0.5)
+ggplotly(g)
+```
+- 8月中旬ころに真の平均が盛り上がる
+    - HIKAKIN_TVの主な視聴者層である[要検証]学生が夏休みであることを反映していると思われる
+
+####予測
+```{r}
+#テストデータ(2016年1月)の作成
+timeseries_test_data <- data %>% filter(label=="hikakin",format(publish,"%Y%m") %in% c("201601")) %>% group_by(publish) %>% summarise(mean_log_viewCount=mean(log_viewCount))
+
+#テストデータを含めてプロット
+plot_data <- data.frame(original=original,mu_state=mu_state,date_seq=date_seq,c05=quant[1,],c95=quant[2,])
+plot_data$original[plot_data$original==9999] <- NA
+g <- ggplot(data=plot_data)
+g <- g + geom_line(aes(x=date_seq,y=original))
+g <- g + geom_line(aes(x=date_seq,y=mu_state),col="blue")
+g <- g + geom_ribbon(aes(x=date_seq,ymin=c05,ymax=c95),col="blue",alpha=0.5)
+g <- g + geom_line(data = timeseries_test_data,aes(x=publish,y=mean_log_viewCount),col="red")
+ggplotly(g)
+
+#テストデータがどれほど信用区間に収まっているか
+mean(quant[1,c(365:395)] < timeseries_test_data$mean_log_viewCount & quant[2,c(365:395)] > timeseries_test_data$mean_log_viewCount)
+```
+
+###ノイズにコーシー分布を仮定する
+
+- 観測ノイズとシステムノイズにコーシー分布を採用．確率密度関数は以下のようになる．
+     $\mu$が位置パラメータ
+     $\sigma$が尺度パラメータ
+    - 正規分布に比べてとても裾が長い．
+    
+$$ Cauchy(x | \mu,\sigma) = \frac{1}{\pi \sigma [1 + (\frac{x-\mu}{\sigma})^{2} ]} $$
+####stanコード
+```{stan output.var="youtubers_state_space_stanmodel",eval=FALSE,cache = FALSE}
+data {
+    int t;
+    int t_miss;
+    real Y_t[t];
+}
+
+parameters {
+    real<lower=0> Y_miss[t_miss];
+    real<lower=0> sigma_state;
+    real<lower=0> sigma_observation;
+    real<lower=0> mu_init;
+    real<lower=-pi()/2,upper=pi()/2> mu_unif[t-1];
+}
+
+transformed parameters {　//パラメータに操作を加える
+   real mu[t];
+   mu[1] = mu_init;
+   for (n in 2:t)
+      mu[n] = mu[n-1] + sigma_state*tan(mu_unif[n-1]);　//一様乱数からコーシー分布に従うサンプルを発生させる
+}
+
+model {
+    int n_miss;
+    n_miss = 0;
+    for(i in 1:t){
+        if(Y_t[i]!=9999){
+          Y_t[i] ~ cauchy(mu[i],sigma_observation); 
+        }else{
+          n_miss = n_miss + 1;
+          Y_miss[n_miss] ~ cauchy(mu[i],sigma_observation); //観測モデル(欠損値)
+        }
+    }
+}
+```
+
+- 裾の重い分布から素直にモデルに加えると収束に時間がかかるので，システムノイズについては，一様乱数を発生させてコーシー分布に従わせている．
+    - 参考：http://statmodeling.hatenablog.com/entry/state-space-model-cauchy
+- Stan Reference Manual v2.8.0 (p.206)によると
+
+> Sampling from heavy tailed distributions such as the Cauchy is difficult for Hamiltonian Monte Carlo, which operates within a Euclidean geometry.2 The practical problem is that tail of the Cauchy requires a relatively large step size compared to the trunk. With a small step size, the No-U-Turn sampler requires many steps when starting in the tail of the distribution; with a large step size, there will be too much rejection in the central portion of the distribution. This problem may be mitigated by defining the Cauchy-distributed variable as the transform of a uniformly distributed variable using the Cauchy inverse cumulative distribution function.
+
+```{r}
+#stanコードをコンパイル
+youtubers_state_space_stanmodel_cauchy <- rstan::stan_model(file = "state_space_cauchy.stan")
+```
+
+####推定
+```{r}
+# 上記のコンパイル済みstanモデルにデータを渡してサンプリング
+# ものすごい時間かかります
+state_space_sample <- sampling(youtubers_state_space_stanmodel_cauchy,data = standata_timeseries,core =  4,iter = 4000)
+```
+
+```{r}
+#トレースプロットを確認
+traceplot(state_space_sample,c("sigma_state"))
+traceplot(state_space_sample,c("sigma_observation"))
+traceplot(state_space_sample,c("mu_init"))
+
+state_space_ex <- rstan::extract(state_space_sample)
+```
+
+正規ノイズの時よりも収束が改善した．
+
+```{r}
+original = Y_t
+mu_state = apply(X = state_space_ex$mu,FUN = mean,MARGIN = 2)
+quant <- apply(state_space_ex$mu,2,quantile,c(0.05,0.95)) #95%信用区間を計算
+date_seq <- seq.Date(as.Date("2015-01-01"),as.Date("2015-12-31")+30,by="days")
+plot_data <- data.frame(original=original,mu_state=mu_state,date_seq=date_seq,c05=quant[1,],c95=quant[2,])
+plot_data$original[plot_data$original==9999] <- NA
+
+#真の平均の推移を合わせてプロット
+g <- ggplot(data=plot_data)
+g <- g + geom_line(aes(x=date_seq,y=original))
+g <- g + geom_line(aes(x=date_seq,y=mu_state),col="blue")
+g <- g + geom_ribbon(aes(x=date_seq,ymin=c05,ymax=c95),col="blue",alpha=0.5)
+ggplotly(g)
+```
+
+####予測
+```{r}
+#テストデータを含めてプロット
+plot_data <- data.frame(original=original,mu_state=mu_state,date_seq=date_seq,c05=quant[1,],c95=quant[2,])
+plot_data$original[plot_data$original==9999] <- NA
+g <- ggplot(data=plot_data)
+g <- g + geom_line(aes(x=date_seq,y=original))
+g <- g + geom_line(aes(x=date_seq,y=mu_state),col="blue")
+g <- g + geom_ribbon(aes(x=date_seq,ymin=c05,ymax=c95),col="blue",alpha=0.5)
+g <- g + geom_line(data = timeseries_test_data,aes(x=publish,y=mean_log_viewCount),col="red")
+ggplotly(g)
+
+#テストデータがどれほど信用区間に収まっているか
+mean(quant[1,c(365:395)] < timeseries_test_data$mean_log_viewCount & quant[2,c(365:395)] > timeseries_test_data$mean_log_viewCount)
+```
+
+かなり過学習ぎみなような気もするが，予測性能は向上した．
