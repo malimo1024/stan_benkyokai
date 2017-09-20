@@ -18,9 +18,7 @@ RStanは字義通りstanをRから扱うインターフェース．
 install.packages("rstan") #なにはともあれrstanをまずインストール
 ```
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE,include = TRUE,warning = FALSE,cache = TRUE)
-
+```{r setup}
 library(dplyr)
 library(magrittr)
 library(rstan)
@@ -28,6 +26,8 @@ library(knitr)
 library(ggplot2)
 library(plotly)
 library(DT)
+
+knitr::opts_chunk$set(echo = TRUE,include = TRUE,warning = FALSE,cache = TRUE)
 ```
 
 #magrittrパッケージのpipe記法について
