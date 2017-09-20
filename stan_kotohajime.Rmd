@@ -57,8 +57,8 @@ y
     - dataフォルダにはその他いろいろなYouTube動画データを取り揃えています．
 
 ```{r readdata}
-hikakin_tv <- read.csv("data/hikakin_tv.csv",stringsAsFactors = FALSE)[,-1]
-seikin_tv <- read.csv("data/seikin_tv.csv",stringsAsFactors = FALSE)[,-1]
+hikakin_tv <- read.csv("data/hikakin_tv.csv",stringsAsFactors = FALSE,fileEncoding = "utf-8")[,-1]
+seikin_tv <- read.csv("data/seikin_tv.csv",stringsAsFactors = FALSE,fileEncoding = "utf-8")[,-1]
 data <- bind_rows(list("hikakin"=hikakin_tv,"seikin"=seikin_tv),.id = "label") #ラベルつきで合併
 ```
 
@@ -446,6 +446,7 @@ g <- g + geom_line(aes(x=date_seq,y=mu_state),col="blue")
 g <- g + geom_ribbon(aes(x=date_seq,ymin=c05,ymax=c95),col="blue",alpha=0.5)
 ggplotly(g)
 ```
+
 - 8月中旬ころに真の平均が盛り上がる
     - HIKAKIN_TVの主な視聴者層である[要検証]学生が夏休みであることを反映していると思われる
 
